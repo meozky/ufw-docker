@@ -63,6 +63,9 @@ function ufw-docker--allow() {
     local INSTANCE_PORT="$2"
     local PROTO="$3"
     local NETWORK="${4:-}"
+    local SRC_ADDR="${5:-any}"
+    local SRC_PORT="${6:-}"
+
 
     docker inspect "$INSTANCE_NAME" &>/dev/null ||
         die "Docker instance \"$INSTANCE_NAME\" doesn't exist."
@@ -89,7 +92,7 @@ function ufw-docker--allow() {
                 if [[ -n "$NETWORK" ]] && [[ "$NETWORK" != "$INSTANCE_NETWORK" ]]; then
                     continue
                 fi
-                ufw-docker--add-rule "$INSTANCE_NAME" "$IP" "${PORT_PROTO%/*}" "${PORT_PROTO#*/}" "${INSTANCE_NETWORK}"
+                ufw-docker--add-rule "$INSTANCE_NAME" "$IP" "${PORT_PROTO%/*}" "${PORT_PROTO#*/}" "${INSTANCE_NETWORK}" "$SRC_ADDR" "$SRC_PORT" 
                 RETVAL="$?"
             done
         fi
@@ -110,7 +113,7 @@ function ufw-docker--add-service-rule() {
 
     [[ -z "$target_ip_port" ]] && die "Could not find VIP of service ${service_id}."
 
-    ufw-docker--add-rule "$service_id" "${target_ip_port%:*}" "$port" "$proto"
+    ufw-docker--add-rule "any" "$service_id" "${target_ip_port%:*}" "$port" "$proto"
 }
 
 function ufw-docker--add-rule() {
@@ -119,18 +122,28 @@ function ufw-docker--add-rule() {
     local PORT="$3"
     local PROTO="$4"
     local NETWORK="${5:-}"
+    local SRC_ADDR="${6:-any}"
+    local SRC_PORT="${7:-}"
 
     declare comment
 
-    echo "allow ${INSTANCE_NAME} ${PORT}/${PROTO} ${NETWORK}"
+    echo "allow from ${SRC_ADDR} ${SRC_PORT} to ${INSTANCE_NAME} ${PORT}/${PROTO} ${NETWORK}"
     typeset -a UFW_OPTS
     UFW_OPTS=(route allow proto "${PROTO}"
-              from any to "$INSTANCE_IP_ADDRESS")
+              from $SRC_ADDR)
     comment="allow ${INSTANCE_NAME}"
+
+    [[ -n "$SRC_PORT" ]] && {
+        UFW_OPTS+=(port "${SRC_PORT}")
+    }
+    
+    UFW_OPTS+=(to "${INSTANCE_IP_ADDRESS}")
+
     [[ -n "$PORT" ]] && {
         UFW_OPTS+=(port "${PORT}")
         comment="$comment ${PORT}/${PROTO}"
     }
+
     [[ -n "$NETWORK" ]] && {
         comment="$comment ${NETWORK}"
     }
@@ -371,7 +384,8 @@ function ufw-docker--install() {
 function ufw-docker--help() {
     cat <<-EOF >&2
 	Usage:
-	  ufw-docker <list|allow> [docker-instance-id-or-name [port[/tcp|/udp]] [network]]
+	  ufw-docker <list|allow> [from <ip-address> to] [docker-instance-id-or-name [port[/tcp|/udp]] [network]]
+
 	  ufw-docker delete allow [docker-instance-id-or-name [port[/tcp|/udp]] [network]]
 
 	  ufw-docker service allow <swarm-service-id-or-name <port</tcp|/udp>>>
@@ -394,6 +408,7 @@ function ufw-docker--help() {
 	  ufw-docker allow httpd 80
 	  ufw-docker allow httpd 80/tcp
 	  ufw-docker allow httpd 80/tcp default
+      ufw-docker allow from 207.46.232.182 to httpd
 
 	  ufw-docker delete allow httpd
 	  ufw-docker delete allow httpd 80/tcp
@@ -420,13 +435,13 @@ function die() {
 
 # __main__
 
-if ! ufw status 2>/dev/null | grep -Fq "Status: active" ; then
-    die "UFW is disabled or you are not root user, or mismatched iptables legacy/nf_tables, current $(iptables --version)"
-fi
+# if ! ufw status 2>/dev/null | grep -Fq "Status: active" ; then
+#     die "UFW is disabled or you are not root user, or mismatched iptables legacy/nf_tables, current $(iptables --version)"
+# fi
 
-if ! docker -v &> /dev/null; then
-  die "Docker executable not found."
-fi
+# if ! docker -v &> /dev/null; then
+#   die "Docker executable not found."
+# fi
 
 ufw_action="${1:-help}"
 
@@ -439,6 +454,26 @@ case "$ufw_action" in
         ;&
     list|allow)
         shift || true
+
+        if [[ "${1:-}" == "from" ]]; then
+            shift || true
+
+            # TODO support IPv6
+            SRC_ADDR="${1:?Missing source IP address.}"
+            if [[ "$SRC_ADDR" != any ]] && ! grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$' <<< "$SRC_ADDR" &>/dev/null; then
+                die "Invalid IP address syntax: $SRC_ADDR"
+            fi
+            shift || true
+
+            if [[ -n "${1:-}" && "${1:-}" =~ [0-9]+ ]]; then
+                SRC_PORT="${1}"
+                shift || true
+            fi
+        fi
+
+        if [[ "${1:-}" == "to" ]]; then
+            shift || true
+        fi
 
         INSTANCE_ID="${1:?Docker instance name/ID cannot be empty.}"
         INSTANCE_NAME="$(ufw-docker--instance-name "$INSTANCE_ID")"
@@ -459,7 +494,7 @@ case "$ufw_action" in
 
         INSTANCE_PORT="${INSTANCE_PORT%/*}"
 
-        "ufw-docker--$ufw_action" "$INSTANCE_NAME" "$INSTANCE_PORT" "$PROTO" "$NETWORK"
+        "ufw-docker--$ufw_action" "$INSTANCE_NAME" "$INSTANCE_PORT" "$PROTO" "$NETWORK" "${SRC_ADDR:-any}" "${SRC_PORT}"
         ;;
     service|raw-command|add-service-rule)
         shift || true
